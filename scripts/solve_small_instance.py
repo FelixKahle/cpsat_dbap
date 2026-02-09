@@ -43,7 +43,7 @@ def run_small_test():
     )
 
     # --- Solve ---
-    config = SolverConfig(time_limit_seconds=10.0, log_search_progress=True)
+    config = SolverConfig(time_limit_seconds=10.0, log_search_progress=False)
     solution = solve(instance, config)
 
     # --- Output ---

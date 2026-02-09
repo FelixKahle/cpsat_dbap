@@ -36,27 +36,28 @@ class Solution:
     vessel_start_times: list[int]
     vessel_end_times: list[int]
     
-    # 'weights' is passed to the constructor but not stored in the class instance
+    # Inputs required for calculation (not stored in final object)
     weights: InitVar[list[int]]
+    arrival_times: InitVar[list[int]]
 
-    # Derived fields (not passed to init, calculated in __post_init__)
+    # Derived fields
     vessel_turnaround_times: list[int] = field(init=False)
     vessel_weighted_turnaround_times: list[int] = field(init=False)
     total_turnaround_time: int = field(init=False)
     total_weighted_turnaround_time: int = field(init=False)
 
-    def __post_init__(self, weights: list[int]):
+    def __post_init__(self, weights: list[int], arrival_times: list[int]):
         n = len(self.vessel_berths)
 
-        # 1. Validation of input lengths
         if len(self.vessel_start_times) != n:
             raise ValueError("start times length mismatch")
         if len(self.vessel_end_times) != n:
             raise ValueError("end times length mismatch")
         if len(weights) != n:
             raise ValueError("weights length mismatch")
+        if len(arrival_times) != n:
+            raise ValueError("arrival_times length mismatch")
 
-        # 2. Calculation
         turnaround = []
         weighted = []
         total_ta = 0
@@ -65,12 +66,17 @@ class Solution:
         for i in range(n):
             start = self.vessel_start_times[i]
             end = self.vessel_end_times[i]
+            arrival = arrival_times[i]
             w = weights[i]
 
             if end < start:
                 raise ValueError(f"end < start for vessel {i}")
 
-            ta = end - start
+            # --- CORRECTION HERE ---
+            # Old: ta = end - start  (This was just processing time)
+            # New: ta = end - arrival (This is true Turnaround/Flow time)
+            ta = end - arrival 
+            
             wta = ta * w
 
             turnaround.append(ta)
@@ -78,7 +84,6 @@ class Solution:
             total_ta += ta
             total_wta += wta
 
-        # 3. Setting fields (using object.__setattr__ because frozen=True)
         object.__setattr__(self, 'vessel_turnaround_times', turnaround)
         object.__setattr__(self, 'vessel_weighted_turnaround_times', weighted)
         object.__setattr__(self, 'total_turnaround_time', total_ta)
@@ -88,15 +93,12 @@ class Solution:
     def num_vessels(self) -> int:
         return len(self.vessel_berths)
 
-    def __len__(self) -> int:
-        return self.num_vessels
-
     @property
     def makespan(self) -> int:
         if not self.vessel_end_times:
             return 0
         return max(self.vessel_end_times)
-
+    
     @property
     def mean_turnaround_time(self) -> float:
         if self.num_vessels == 0:

@@ -24,11 +24,11 @@ from __future__ import annotations
 import os
 import heapq
 from dataclasses import dataclass
-from typing import Any, Optional, List, Tuple
+from typing import Optional, List, Tuple, Dict, Any
 
 from ortools.sat.python import cp_model
 
-from .instance import DBAPInstance, ProcessingTime  # <-- Add the dot
+from .instance import DBAPInstance
 from .solution import Solution
 
 # ============================================================
@@ -41,118 +41,100 @@ class SolverConfig:
     Configuration parameters for the CP-SAT solver.
     """
     time_limit_seconds: float = 60.0
-    num_workers: int = 8  # 0 means all available cores
+    num_workers: int = os.cpu_count() or 0
     log_search_progress: bool = True
     random_seed: int = 42
     use_hints: bool = True
 
 
 # ============================================================
-# Horizon Calculation
+# Heuristic (Earliest Deadline First)
 # ============================================================
 
-def determine_horizon_bound(instance: DBAPInstance) -> int:
+def greedy_heuristic(instance: DBAPInstance) -> Optional[Solution]:
     """
-    Calculates a mathematically proven upper bound for the horizon.
-    Logic: The optimal Total Flow Cost cannot exceed the Total Flow Cost of 
-    a simple greedy schedule. 
+    Constructs a feasible solution using an Earliest-Deadline-First (EDF) rule.
+    For each vessel, it selects the berth that minimizes the completion time.
+    
+    Returns None if the greedy approach fails to respect strict windows.
     """
-    # 1. Sort vessels by Arrival Time (Standard Greedy approach)
-    # We store (arrival_time, vessel_index)
+    if instance.num_vessels == 0:
+        return Solution([], [], [], [], [])
+
+    # Sort vessels by Deadline (primary) and Arrival (secondary)
+    # This acts like a sweep-line prioritizing urgency.
     sorted_vessels = sorted(
         range(instance.num_vessels), 
-        key=lambda v: instance.arrival_times[v]
+        key=lambda v: (instance.latest_departure_times[v], instance.arrival_times[v])
     )
     
-    # 2. Priority Queue for Berths: stores (available_time, berth_id)
-    # Initialize all berths at their opening times
-    berth_heap: List[Tuple[int, int]] = []
-    for b_id in range(instance.num_berths):
-        interval = instance.berth_opening_times[b_id]
-        heapq.heappush(berth_heap, (interval.start, b_id))
+    # Track when each berth becomes free. 
+    # Initially, this is the berth's opening time.
+    berth_free_times = [
+        instance.berth_opening_times[b].start 
+        for b in range(instance.num_berths)
+    ]
     
-    greedy_max_finish = 0
+    # Storage for the solution
+    v_berths = [0] * instance.num_vessels
+    v_starts = [0] * instance.num_vessels
+    v_ends = [0] * instance.num_vessels
     
-    # 3. Simulate Schedule
     for v_id in sorted_vessels:
         arrival = instance.arrival_times[v_id]
+        deadline = instance.latest_departure_times[v_id]
         
-        # Try to find the earliest available berth that can process this vessel
-        temp_popped = []
-        chosen_finish = float('inf')
-        chosen_b_id = -1
+        best_finish = float('inf')
+        best_start = -1
+        best_b_id = -1
         
-        # Pop berths until we find a valid one or run out
-        while berth_heap:
-            avail_time, b_id = heapq.heappop(berth_heap)
-            
-            # Check if this berth can handle this vessel
+        # Scan ALL berths to find the best fit for this urgent vessel
+        for b_id in range(instance.num_berths):
+            # 1. Check processing validity
             pt = instance.processing_times[v_id][b_id]
+            if pt.is_invalid:
+                continue
             
-            if pt.is_valid:
-                # Found valid berth!
-                duration = pt.value()
-                start_time = max(arrival, avail_time)
-                chosen_finish = start_time + duration
-                chosen_b_id = b_id
-                
-                # Push back the chosen berth with new availability
-                heapq.heappush(berth_heap, (chosen_finish, chosen_b_id))
-                break
-            else:
-                # Store incompatible berth to put back later
-                temp_popped.append((avail_time, b_id))
+            duration = pt.value()
+            berth_window = instance.berth_opening_times[b_id]
+            
+            # 2. Calculate Timing
+            # Start = Max(Vessel Arrival, Berth Free Time, Berth Open Time)
+            possible_start = max(arrival, berth_free_times[b_id], berth_window.start)
+            possible_end = possible_start + duration
+            
+            # 3. Check Constraints
+            # - Must finish before berth closes
+            # - Must finish before vessel deadline
+            if (possible_end <= berth_window.finish) and (possible_end <= deadline):
+                # We greedily minimize finish time to keep the horizon compact
+                if possible_end < best_finish:
+                    best_finish = possible_end
+                    best_start = possible_start
+                    best_b_id = b_id
         
-        # Put back the incompatible berths we popped
-        for item in temp_popped:
-            heapq.heappush(berth_heap, item)
-            
-        if chosen_b_id == -1:
-            # Fallback: If heuristic fails (e.g. strict forbidden windows), 
-            # use a conservative bound: Max Arrival + Sum of Max Durations
-            total_max_duration = 0
-            for v in range(instance.num_vessels):
-                valid_durations = [
-                    p.value() for p in instance.processing_times[v] if p.is_valid
-                ]
-                if valid_durations:
-                    total_max_duration += max(valid_durations)
-            
-            max_arr = max(instance.arrival_times)
-            return max_arr + total_max_duration
+        # If no valid berth found for this vessel, the heuristic fails
+        if best_b_id == -1:
+            return None
 
-        greedy_max_finish = max(greedy_max_finish, chosen_finish)
-
-    # 4. Calculate The Rigorous Bound
-    # Generally, specific horizon = Greedy Makespan + Sum of Processing Times is extremely loose.
-    # A tighter bound for CP is often: Greedy Makespan * 1.5 or just a large safe integer.
-    # However, to be safe and allow the solver room to optimize "waiting", 
-    # we usually set it to (Max Arrival + Sum of all processing times).
-    
-    # Let's use the logic from the original script:
-    # proven_horizon = greedy_total_flow + max_arrival (This was in the original script)
-    # But strictly speaking for CP domains, we just need a valid upper bound for the *latest completion time*.
-    
-    # We will use: Sum of all maximum processing times + Max Arrival. 
-    # This guarantees that even if every ship waits for every other ship, it fits.
-    
-    total_max_proc = 0
-    for v in range(instance.num_vessels):
-        valid_ps = [p.value() for p in instance.processing_times[v] if p.is_valid]
-        if valid_ps:
-            total_max_proc += max(valid_ps)
-            
-    max_arrival = max(instance.arrival_times) if instance.arrival_times else 0
-    
-    # Respect the hard deadlines from input if they exist and are binding
-    # (The instance has 'latest_departure_times', but those might be infinite/large)
-    
-    calculated_horizon = max_arrival + total_max_proc
-    
-    # If the instance has tighter deadlines, we can clamp, but usually
-    # we want the horizon large enough to prove infeasibility if deadlines can't be met.
-    return calculated_horizon
-
+        # Assign
+        v_berths[v_id] = best_b_id
+        v_starts[v_id] = best_start
+        v_ends[v_id] = int(best_finish)
+        
+        # Update berth availability
+        berth_free_times[best_b_id] = int(best_finish)
+        
+    try:
+        return Solution(
+            vessel_berths=v_berths, 
+            vessel_start_times=v_starts, 
+            vessel_end_times=v_ends, 
+            weights=instance.vessel_weights,
+            arrival_times=instance.arrival_times # <--- Pass this
+        )
+    except ValueError:
+        return None
 
 # ============================================================
 # Main Solver Logic
@@ -162,12 +144,37 @@ def solve(instance: DBAPInstance, config: SolverConfig = SolverConfig()) -> Opti
     """
     Solves the Discrete Berth Allocation Problem using CP-SAT.
     """
+    # 0. Edge Cases
+    if instance.num_vessels == 0:
+        return Solution([], [], [], [], [])
+
+    # 1. Run Heuristic for Horizon & Hints
+    greedy_sol = greedy_heuristic(instance)
+    
+    # Calculate a safe horizon
+    max_arrival = max(instance.arrival_times)
+    sum_max_durations = 0
+    for v in range(instance.num_vessels):
+        valid_pts = [pt.value() for pt in instance.processing_times[v] if pt.is_valid]
+        if valid_pts:
+            sum_max_durations += max(valid_pts)
+        else:
+            print(f"Warning: Vessel {v} has no valid berths.")
+            return None # Impossible instance
+
+    # Horizon logic:
+    # If greedy found a solution, we know a feasible upper bound.
+    # We use a loose bound for the model variables to allow optimization, 
+    # but strictly clamp variables that exceed reasonable limits.
+    horizon = max_arrival + sum_max_durations
+
+    # Clamp by global max deadline if it's tighter than our calculated horizon
+    global_deadline_max = max(instance.latest_departure_times)
+    if global_deadline_max < horizon:
+        horizon = global_deadline_max
+
+    # --- Build Model ---
     model: Any = cp_model.CpModel()
-    
-    # 1. Horizon
-    horizon = determine_horizon_bound(instance)
-    
-    # --- Variables ---
     
     # vessel_vars[v] = { 'start': var, 'end': var, 'berth': var }
     vessel_vars = {}
@@ -175,100 +182,88 @@ def solve(instance: DBAPInstance, config: SolverConfig = SolverConfig()) -> Opti
     # intervals_per_berth[b] = [interval_var, ...]
     intervals_per_berth = [[] for _ in range(instance.num_berths)]
     
-    # We need to map which berth is chosen for the solution reconstruction
-    # (vessel, berth) -> boolean_presence_var
-    allocation_bools = {} 
+    # Store boolean presence vars for search strategy
+    all_presence_literals = []
 
-    # 2. Build Model
     for v in range(instance.num_vessels):
         arrival = instance.arrival_times[v]
         latest_departure = instance.latest_departure_times[v]
-        
-        # Master variables for this vessel
-        # Constrain domain by arrival and hard deadline (if < horizon)
         upper_bound = min(horizon, latest_departure)
         
+        # Master variables
         v_start = model.NewIntVar(arrival, upper_bound, f'v{v}_start')
         v_end = model.NewIntVar(arrival, upper_bound, f'v{v}_end')
         v_berth = model.NewIntVar(0, instance.num_berths - 1, f'v{v}_berth')
         
         vessel_vars[v] = {'start': v_start, 'end': v_end, 'berth': v_berth}
+        
+        # Optimization: Hint from greedy
+        if config.use_hints and greedy_sol:
+            model.AddHint(v_start, greedy_sol.vessel_start_times[v])
+            model.AddHint(v_berth, greedy_sol.vessel_berths[v])
 
-        # Create optional intervals for each berth
         possible_berths = []
         
         for b in range(instance.num_berths):
             pt = instance.processing_times[v][b]
-            
-            # Skip invalid (forbidden) assignments
-            if pt.is_invalid:
-                continue
+            if pt.is_invalid: continue
 
             duration = pt.value()
             berth_interval = instance.berth_opening_times[b]
             
-            # Sanity check: if berth closes before arrival, skip
-            if berth_interval.finish < arrival:
+            # Basic sanity check: if berth closes before arrival + duration, it's impossible
+            if berth_interval.finish < arrival + duration:
                 continue
             
-            # Create presence boolean
+            # Presence Boolean
             is_present = model.NewBoolVar(f'pres_v{v}_b{b}')
-            allocation_bools[(v, b)] = is_present
             possible_berths.append(is_present)
+            all_presence_literals.append(is_present)
             
-            # Local start/end for this specific berth assignment
-            # Must be within berth opening times
-            local_start = model.NewIntVar(
-                max(arrival, berth_interval.start), 
-                min(upper_bound, berth_interval.finish), 
-                f'start_v{v}_b{b}'
-            )
+            # Optimization: Hint presence
+            if config.use_hints and greedy_sol:
+                was_chosen = (greedy_sol.vessel_berths[v] == b)
+                model.AddHint(is_present, 1 if was_chosen else 0)
+
+            # Local Interval
+            # Note: We enforce start >= arrival AND start >= berth_open
+            safe_start_min = max(arrival, berth_interval.start)
             
-            local_end = model.NewIntVar(
-                max(arrival, berth_interval.start) + duration,
-                min(upper_bound, berth_interval.finish),
-                f'end_v{v}_b{b}'
-            )
+            local_start = model.NewIntVar(safe_start_min, upper_bound, f's_v{v}_b{b}')
+            local_end = model.NewIntVar(safe_start_min + duration, upper_bound, f'e_v{v}_b{b}')
             
-            # Optional Interval for NoOverlap
             interval = model.NewOptionalIntervalVar(
-                local_start, duration, local_end, is_present, f'interval_v{v}_b{b}'
+                local_start, duration, local_end, is_present, f'int_v{v}_b{b}'
             )
             intervals_per_berth[b].append(interval)
             
-            # Link Local -> Master variables
-            # If present on berth b:
-            # 1. master_start == local_start
-            # 2. master_end   == local_end
-            # 3. master_berth == b
+            # Link to Master
             model.Add(v_start == local_start).OnlyEnforceIf(is_present)
             model.Add(v_end == local_end).OnlyEnforceIf(is_present)
             model.Add(v_berth == b).OnlyEnforceIf(is_present)
 
-        # Constraint: Vessel must be assigned to exactly one valid berth
         if not possible_berths:
-            # Infeasible for this vessel
-            return None
+            return None # Infeasible
             
         model.Add(sum(possible_berths) == 1)
 
-    # 3. Disjunctive Constraints (No Overlap per berth)
+    # Disjunctive Constraints
     for b in range(instance.num_berths):
         if intervals_per_berth[b]:
             model.AddNoOverlap(intervals_per_berth[b])
 
-    # 4. Objective: Minimize Total Flow Time (equivalent to minimizing Sum of End Times)
-    # Objective = Sum(End_v - Arrival_v)
-    # Since Arrival_v is constant, we just Minimize(Sum(End_v))
+    # Objective: Minimize Total Flow Time
     total_completion_time = sum(vessel_vars[v]['end'] for v in range(instance.num_vessels))
     model.Minimize(total_completion_time)
     
-    # 5. Hints (Optional)
-    if config.use_hints:
-        # Simple heuristic: sort by arrival
-        sorted_vessels = sorted(range(instance.num_vessels), key=lambda x: instance.arrival_times[x])
-        for v in sorted_vessels:
-            model.AddHint(vessel_vars[v]['start'], instance.arrival_times[v])
+    # --- Search Strategy ---
+    # Crucial for performance: Tell solver to decide assignments (booleans) first.
+    # This reduces the search space from "When and Where?" to just "When?" (which is easy).
+    model.AddDecisionStrategy(
+        all_presence_literals, 
+        cp_model.CHOOSE_FIRST, 
+        cp_model.SELECT_MAX_VALUE # Try setting to True first (though conflict analysis will guide it)
+    )
 
     # --- Solve ---
     solver = cp_model.CpSolver()
@@ -279,28 +274,17 @@ def solve(instance: DBAPInstance, config: SolverConfig = SolverConfig()) -> Opti
     
     status = solver.Solve(model)
 
-    # --- Extract Solution ---
     if status in (cp_model.OPTIMAL, cp_model.FEASIBLE):
-        
-        res_berths = [0] * instance.num_vessels
-        res_starts = [0] * instance.num_vessels
-        res_ends = [0] * instance.num_vessels
-        
-        for v in range(instance.num_vessels):
-            res_starts[v] = solver.Value(vessel_vars[v]['start'])
-            res_ends[v] = solver.Value(vessel_vars[v]['end'])
-            res_berths[v] = solver.Value(vessel_vars[v]['berth'])
-            
-            # Double check against allocation bools (sanity check)
-            # for b in range(instance.num_berths):
-            #     if (v, b) in allocation_bools and solver.Value(allocation_bools[(v, b)]):
-            #         assert res_berths[v] == b
+        res_berths = [solver.Value(vessel_vars[v]['berth']) for v in range(instance.num_vessels)]
+        res_starts = [solver.Value(vessel_vars[v]['start']) for v in range(instance.num_vessels)]
+        res_ends = [solver.Value(vessel_vars[v]['end']) for v in range(instance.num_vessels)]
         
         return Solution(
             vessel_berths=res_berths,
             vessel_start_times=res_starts,
             vessel_end_times=res_ends,
-            weights=instance.vessel_weights
+            weights=instance.vessel_weights,
+            arrival_times=instance.arrival_times # <--- Pass this
         )
     
     return None
