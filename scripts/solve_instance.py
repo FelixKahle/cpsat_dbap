@@ -61,7 +61,6 @@ def main():
     # ------------------------------------------------------------------
     # 3. Configure & Solve
     # ------------------------------------------------------------------
-    # 20 seconds time limit as requested
     config = SolverConfig(
         time_limit_seconds=40.0,
         log_search_progress=False,

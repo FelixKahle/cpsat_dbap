@@ -22,9 +22,8 @@
 from __future__ import annotations
 
 import os
-import heapq
 from dataclasses import dataclass
-from typing import Optional, List, Tuple, Dict, Any
+from typing import Optional, Any
 
 from ortools.sat.python import cp_model
 
@@ -144,6 +143,7 @@ def solve(instance: DBAPInstance, config: SolverConfig = SolverConfig()) -> Opti
     """
     Solves the Discrete Berth Allocation Problem using CP-SAT.
     """
+
     # 0. Edge Cases
     if instance.num_vessels == 0:
         return Solution([], [], [], [], [])
@@ -159,16 +159,9 @@ def solve(instance: DBAPInstance, config: SolverConfig = SolverConfig()) -> Opti
         if valid_pts:
             sum_max_durations += max(valid_pts)
         else:
-            print(f"Warning: Vessel {v} has no valid berths.")
             return None # Impossible instance
 
-    # Horizon logic:
-    # If greedy found a solution, we know a feasible upper bound.
-    # We use a loose bound for the model variables to allow optimization, 
-    # but strictly clamp variables that exceed reasonable limits.
     horizon = max_arrival + sum_max_durations
-
-    # Clamp by global max deadline if it's tighter than our calculated horizon
     global_deadline_max = max(instance.latest_departure_times)
     if global_deadline_max < horizon:
         horizon = global_deadline_max
@@ -176,28 +169,33 @@ def solve(instance: DBAPInstance, config: SolverConfig = SolverConfig()) -> Opti
     # --- Build Model ---
     model: Any = cp_model.CpModel()
     
-    # vessel_vars[v] = { 'start': var, 'end': var, 'berth': var }
+    # vessel_vars[v] = { 'start': var, 'berth': var }  <-- Removed 'end'
     vessel_vars = {}
     
     # intervals_per_berth[b] = [interval_var, ...]
     intervals_per_berth = [[] for _ in range(instance.num_berths)]
     
-    # Store boolean presence vars for search strategy
+    # Store literals for search strategy
     all_presence_literals = []
+    
+    # Accumulate terms for the objective function here
+    objective_terms = []
 
     for v in range(instance.num_vessels):
         arrival = instance.arrival_times[v]
         latest_departure = instance.latest_departure_times[v]
         upper_bound = min(horizon, latest_departure)
         
-        # Master variables
+        # Master variables (v_end is REMOVED)
         v_start = model.NewIntVar(arrival, upper_bound, f'v{v}_start')
-        v_end = model.NewIntVar(arrival, upper_bound, f'v{v}_end')
         v_berth = model.NewIntVar(0, instance.num_berths - 1, f'v{v}_berth')
         
-        vessel_vars[v] = {'start': v_start, 'end': v_end, 'berth': v_berth}
+        vessel_vars[v] = {'start': v_start, 'berth': v_berth}
         
-        # Optimization: Hint from greedy
+        # Add Start Time to objective (End = Start + Duration)
+        objective_terms.append(v_start)
+        
+        # Hints
         if config.use_hints and greedy_sol:
             model.AddHint(v_start, greedy_sol.vessel_start_times[v])
             model.AddHint(v_berth, greedy_sol.vessel_berths[v])
@@ -211,7 +209,6 @@ def solve(instance: DBAPInstance, config: SolverConfig = SolverConfig()) -> Opti
             duration = pt.value()
             berth_interval = instance.berth_opening_times[b]
             
-            # Basic sanity check: if berth closes before arrival + duration, it's impossible
             if berth_interval.finish < arrival + duration:
                 continue
             
@@ -220,16 +217,20 @@ def solve(instance: DBAPInstance, config: SolverConfig = SolverConfig()) -> Opti
             possible_berths.append(is_present)
             all_presence_literals.append(is_present)
             
-            # Optimization: Hint presence
+            # Add (is_present * duration) to objective
+            # This accounts for the variable duration depending on berth choice
+            objective_terms.append(is_present * duration)
+            
+            # Hint presence
             if config.use_hints and greedy_sol:
                 was_chosen = (greedy_sol.vessel_berths[v] == b)
                 model.AddHint(is_present, 1 if was_chosen else 0)
 
             # Local Interval
-            # Note: We enforce start >= arrival AND start >= berth_open
             safe_start_min = max(arrival, berth_interval.start)
             
             local_start = model.NewIntVar(safe_start_min, upper_bound, f's_v{v}_b{b}')
+            # We still need local_end for the interval definition, but we don't link it to a master var
             local_end = model.NewIntVar(safe_start_min + duration, upper_bound, f'e_v{v}_b{b}')
             
             interval = model.NewOptionalIntervalVar(
@@ -237,13 +238,12 @@ def solve(instance: DBAPInstance, config: SolverConfig = SolverConfig()) -> Opti
             )
             intervals_per_berth[b].append(interval)
             
-            # Link to Master
+            # Link to Master Start & Berth
             model.Add(v_start == local_start).OnlyEnforceIf(is_present)
-            model.Add(v_end == local_end).OnlyEnforceIf(is_present)
             model.Add(v_berth == b).OnlyEnforceIf(is_present)
 
         if not possible_berths:
-            return None # Infeasible
+            return None
             
         model.Add(sum(possible_berths) == 1)
 
@@ -252,17 +252,14 @@ def solve(instance: DBAPInstance, config: SolverConfig = SolverConfig()) -> Opti
         if intervals_per_berth[b]:
             model.AddNoOverlap(intervals_per_berth[b])
 
-    # Objective: Minimize Total Flow Time
-    total_completion_time = sum(vessel_vars[v]['end'] for v in range(instance.num_vessels))
-    model.Minimize(total_completion_time)
+    # Objective: Minimize Sum of (Start + Duration)
+    model.Minimize(sum(objective_terms))
     
     # --- Search Strategy ---
-    # Crucial for performance: Tell solver to decide assignments (booleans) first.
-    # This reduces the search space from "When and Where?" to just "When?" (which is easy).
     model.AddDecisionStrategy(
         all_presence_literals, 
         cp_model.CHOOSE_FIRST, 
-        cp_model.SELECT_MAX_VALUE # Try setting to True first (though conflict analysis will guide it)
+        cp_model.SELECT_MAX_VALUE
     )
 
     # --- Solve ---
@@ -275,16 +272,30 @@ def solve(instance: DBAPInstance, config: SolverConfig = SolverConfig()) -> Opti
     status = solver.Solve(model)
 
     if status in (cp_model.OPTIMAL, cp_model.FEASIBLE):
-        res_berths = [solver.Value(vessel_vars[v]['berth']) for v in range(instance.num_vessels)]
-        res_starts = [solver.Value(vessel_vars[v]['start']) for v in range(instance.num_vessels)]
-        res_ends = [solver.Value(vessel_vars[v]['end']) for v in range(instance.num_vessels)]
+        res_berths = []
+        res_starts = []
+        res_ends = []
+
+        for v in range(instance.num_vessels):
+            # Retrieve solver values
+            b_val = solver.Value(vessel_vars[v]['berth'])
+            s_val = solver.Value(vessel_vars[v]['start'])
+            
+            # Re-calculate End Time: Start + Duration of chosen berth
+            # We must look up the processing time from the instance data again
+            duration = instance.processing_times[v][b_val].value()
+            e_val = s_val + duration
+            
+            res_berths.append(b_val)
+            res_starts.append(s_val)
+            res_ends.append(e_val)
         
         return Solution(
             vessel_berths=res_berths,
             vessel_start_times=res_starts,
             vessel_end_times=res_ends,
             weights=instance.vessel_weights,
-            arrival_times=instance.arrival_times # <--- Pass this
+            arrival_times=instance.arrival_times
         )
     
     return None
