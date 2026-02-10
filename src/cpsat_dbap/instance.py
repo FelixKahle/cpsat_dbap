@@ -20,8 +20,8 @@
 # WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 
 from __future__ import annotations
-from dataclasses import dataclass, field
-from typing import List, Optional, TextIO, Union, Generator, Iterator, Callable
+from dataclasses import dataclass
+from typing import List, Optional, TextIO, Union, Iterator, Callable
 
 # ============================================================
 # ProcessingTime
@@ -30,22 +30,35 @@ from typing import List, Optional, TextIO, Union, Generator, Iterator, Callable
 @dataclass(frozen=True, order=True)
 class ProcessingTime:
     """
-    Represents a processing time in integer units.
-    
-    - time >= 0 -> valid
-    - time < 0  -> invalid sentinel
+    Represents a discrete processing time unit.
+
+    This class encapsulates time values while providing a sentinel mechanism
+    for invalid or forbidden processing times (e.g., when a specific vessel
+    cannot be serviced at a specific berth).
+
+    Attributes:
+        time: The integer value of time. Non-negative values are valid;
+              negative values indicate an invalid state.
     """
     time: int
 
     @property
     def is_valid(self) -> bool:
+        """Checks if the processing time represents a valid duration."""
         return self.time >= 0
 
     @property
     def is_invalid(self) -> bool:
+        """Checks if the processing time represents a forbidden or invalid state."""
         return self.time < 0
 
     def value(self) -> int:
+        """
+        Returns the raw integer time value.
+
+        Raises:
+            ValueError: If the processing time is invalid.
+        """
         if self.is_valid:
             return self.time
         raise ValueError("Invalid ProcessingTime has no usable value")
@@ -56,12 +69,14 @@ class ProcessingTime:
     def __int__(self) -> int:
         return self.value()
 
-    # --- Arithmetic ---
+    # --- Arithmetic Operations ---
 
     def _combine(self, other: Union[ProcessingTime, int], op: Callable[[int, int], int]) -> ProcessingTime:
+        """Helper to combine two time values using a given operator."""
         if isinstance(other, int):
             other = ProcessingTime(other)
         
+        # Propagation of invalidity: if either operand is invalid, the result is invalid.
         if self.is_valid and other.is_valid:
             return ProcessingTime(op(self.time, other.time))
         return INVALID_PROCESSING_TIME
@@ -76,7 +91,8 @@ class ProcessingTime:
         return self._combine(other, lambda a, b: a - b)
 
     def __rsub__(self, other: int) -> ProcessingTime:
-        # Check explicitly because subtraction is non-commutative
+        # Subtraction is non-commutative; we must explicitly wrap the integer
+        # and check validity order.
         other_pt = ProcessingTime(other)
         if other_pt.is_valid and self.is_valid:
             return ProcessingTime(other - self.time)
@@ -92,10 +108,12 @@ class ProcessingTime:
         if isinstance(other, int):
             other = ProcessingTime(other)
         
+        # Check for division by zero and validity
         if self.is_valid and other.is_valid and other.time != 0:
             return ProcessingTime(self.time // other.time)
         return INVALID_PROCESSING_TIME
 
+# Sentinel constant for invalid time
 INVALID_PROCESSING_TIME = ProcessingTime(-1)
 
 
@@ -106,44 +124,66 @@ INVALID_PROCESSING_TIME = ProcessingTime(-1)
 @dataclass(frozen=True, order=True)
 class HalfOpenInterval:
     """
-    Represents interval [start_inclusive, end_exclusive).
+    Represents a time interval [start, end).
+    
+    The interval includes the start point but excludes the end point.
+    This structure is often preferred for discrete scheduling to avoid
+    off-by-one errors during adjacency checks.
     """
     start_inclusive: int
     end_exclusive: int
 
     def __post_init__(self) -> None:
+        """Validates that the interval is well-formed (start <= end)."""
         if self.end_exclusive < self.start_inclusive:
             raise ValueError(f"Interval end ({self.end_exclusive}) must be >= start ({self.start_inclusive})")
 
     @property
     def start(self) -> int:
+        """Alias for the inclusive start time."""
         return self.start_inclusive
     
     @property
     def finish(self) -> int:
+        """Alias for the exclusive end time."""
         return self.end_exclusive
 
     def __len__(self) -> int:
+        """Returns the duration of the interval."""
         return self.end_exclusive - self.start_inclusive
 
     def is_empty(self) -> bool:
+        """True if the duration is zero."""
         return len(self) == 0
 
     def contains(self, t: int) -> bool:
+        """Checks if time t lies within [start, end)."""
         return self.start_inclusive <= t < self.end_exclusive
     
     def __contains__(self, item: int) -> bool:
         return self.contains(item)
 
     def overlaps(self, other: HalfOpenInterval) -> bool:
+        """
+        Checks if this interval overlaps with another.
+        
+        Logic: Start of one must be strictly less than the End of the other.
+        """
         return (self.start_inclusive < other.end_exclusive) and \
                (other.start_inclusive < self.end_exclusive)
 
     def adjacent(self, other: HalfOpenInterval) -> bool:
+        """
+        Checks if two intervals touch without overlapping.
+        e.g., [0, 5) and [5, 10).
+        """
         return (self.end_exclusive == other.start_inclusive) or \
                (other.end_exclusive == self.start_inclusive)
 
     def intersection(self, other: HalfOpenInterval) -> Optional[HalfOpenInterval]:
+        """
+        Returns the intersection of two intervals, or None if disjoint.
+        """
         if self.overlaps(other):
             return HalfOpenInterval(
                 max(self.start_inclusive, other.start_inclusive),
@@ -162,7 +202,17 @@ class HalfOpenInterval:
 @dataclass(frozen=True)
 class DBAPInstance:
     """
-    Container describing a berth allocation instance.
+    Immutable container for the Discrete Berth Allocation Problem (DBAP) data.
+
+    Attributes:
+        num_vessels: Total number of vessels to be serviced.
+        num_berths: Total number of available berths.
+        vessel_weights: Priority weights for each vessel (default 1).
+        arrival_times: The earliest time each vessel arrives at the port.
+        latest_departure_times: The hard deadline for each vessel.
+        processing_times: A matrix [vessel][berth] representing service duration.
+                          Invalid durations are marked with sentinel values.
+        berth_opening_times: Availability windows for each berth.
     """
     num_vessels: int
     num_berths: int
@@ -174,26 +224,26 @@ class DBAPInstance:
     berth_opening_times: List[HalfOpenInterval]
 
     def __post_init__(self) -> None:
-        # Validations
+        """Validates array dimensions match vessel and berth counts."""
         if len(self.vessel_weights) != self.num_vessels:
-            raise ValueError("vessel_weights mismatch")
+            raise ValueError("vessel_weights length mismatch")
         if len(self.arrival_times) != self.num_vessels:
-            raise ValueError("arrival_times mismatch")
+            raise ValueError("arrival_times length mismatch")
         if len(self.latest_departure_times) != self.num_vessels:
-            raise ValueError("latest_departure_times mismatch")
+            raise ValueError("latest_departure_times length mismatch")
         if len(self.processing_times) != self.num_vessels:
             raise ValueError("processing matrix rows mismatch")
         if any(len(row) != self.num_berths for row in self.processing_times):
             raise ValueError("processing matrix columns mismatch")
         if len(self.berth_opening_times) != self.num_berths:
-            raise ValueError("berth intervals mismatch")
+            raise ValueError("berth intervals length mismatch")
 
     def get_processing_time(self, v: int, b: int) -> ProcessingTime:
-        # Adjust for 0-based indexing if input is 0-based, or assumes caller handles it.
-        # Python uses 0-based indexing.
+        """Retrieves processing time for vessel v at berth b."""
         return self.processing_times[v][b]
 
     def get_berth_interval(self, b: int) -> HalfOpenInterval:
+        """Retrieves the availability interval for berth b."""
         return self.berth_opening_times[b]
 
     def __str__(self) -> str:
@@ -206,27 +256,36 @@ class DBAPInstance:
 
 def parse_instance(source: Union[str, TextIO], forbidden_threshold: int = 99999) -> DBAPInstance:
     """
-    Parse a DBAP instance from a string or IO stream.
+    Parses a DBAP instance from a string or file-like object.
 
-    Input Format (Whitespace separated):
-    N (vessels)
-    M (berths)
-    ta_1 ... ta_|N|         (arrivals)
-    s_1 ... s_|M|           (opening times)
-    h_1_1 ... h_1_|M|       (processing times row 1)
-    ...
-    h_|N|_1 ... h_|N|_|M|   (processing times row N)
-    e_1 ... e_|M|           (ending times)
-    t'_1 ... t'_|N|         (max departure times)
+    The format is whitespace-delimited integers:
+      N M             (Vessels, Berths)
+      [Arrivals]      (N integers)
+      [Openings]      (M integers)
+      [Proc Matrix]   (N rows * M cols integers)
+      [Endings]       (M integers)
+      [Deadlines]     (N integers)
+
+    Args:
+        source: A raw string containing the data or a file object.
+        forbidden_threshold: Integer value in the input above which a 
+                             processing time is considered invalid/forbidden.
+
+    Returns:
+        A validated DBAPInstance object.
+
+    Raises:
+        ValueError: If data is malformed or logical constraints (start < end) are violated.
+        EOFError: If the input stream ends prematurely.
     """
 
-    # Create a token generator
+    # Helper generator to lazily yield whitespace-separated tokens
     def token_generator(src: Union[str, TextIO]) -> Iterator[str]:
         if isinstance(src, str):
             yield from src.split()
         else:
-            # Read chunks or lines to avoid loading massive files into RAM if unnecessary
-            # For simplicity and standard compliance with whitespace skipping:
+            # Read the entire content at once for standard compliance with
+            # whitespace splitting, suitable for typical instance sizes.
             content = src.read()
             yield from content.split()
 
@@ -236,24 +295,25 @@ def parse_instance(source: Union[str, TextIO], forbidden_threshold: int = 99999)
         try:
             return int(next(tokens))
         except StopIteration:
-            raise EOFError("Unexpected end of input")
+            raise EOFError("Unexpected end of input while reading instance data")
         except ValueError:
-            raise ValueError("Invalid integer token")
+            raise ValueError("Encountered non-integer token in input")
 
-    # 1. Header
+    # Read problem dimensions
     n = read_int()
     m = read_int()
 
     if n <= 0: raise ValueError("Number of vessels must be positive")
     if m <= 0: raise ValueError("Number of berths must be positive")
 
-    # 2. Arrivals
+    # Read vessel arrival times
     arrivals = [read_int() for _ in range(n)]
 
-    # 3. Openings (Berth start times)
+    # Read berth opening times (start of availability)
     openings = [read_int() for _ in range(m)]
 
-    # 4. Handling Matrix (Processing Times)
+    # Read processing time matrix (N rows, M columns)
+    # Values >= forbidden_threshold are converted to INVALID_PROCESSING_TIME
     proc_matrix: List[List[ProcessingTime]] = []
     for _ in range(n):
         row: List[ProcessingTime] = []
@@ -265,29 +325,29 @@ def parse_instance(source: Union[str, TextIO], forbidden_threshold: int = 99999)
                 row.append(ProcessingTime(h))
         proc_matrix.append(row)
 
-    # 5. Endings (Berth end times)
+    # Read berth closing times (end of availability)
     endings = [read_int() for _ in range(m)]
 
-    # Validate intervals immediately (closed form check)
+    # Immediate validation of berth windows
     for i in range(m):
         if openings[i] > endings[i]:
             raise ValueError(f"Invalid berth interval at index {i}: start {openings[i]} > end {endings[i]}")
 
-    # 6. Latest departures
+    # Read latest departure times (deadlines)
     latest = [read_int() for _ in range(n)]
 
-    # Logical sanity: arrival <= latest
+    # Logical validation: Arrival cannot be later than Deadline
     for i in range(n):
         if arrivals[i] > latest[i]:
             raise ValueError(f"Arrival exceeds latest departure for vessel {i}")
 
-    # 7. Interval Construction (Closed [s, e] -> Half-Open [s, e+1))
+    # Convert closed input intervals [start, end] to internal HalfOpenIntervals [start, end + 1)
     intervals = [
         HalfOpenInterval(openings[i], endings[i] + 1)
         for i in range(m)
     ]
 
-    # Default weights (all 1)
+    # Initialize default weights (all 1)
     weights = [1] * n
 
     return DBAPInstance(

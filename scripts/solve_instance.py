@@ -24,20 +24,34 @@ import sys
 import matplotlib.pyplot as plt
 from pathlib import Path
 
-# Explicitly add 'src' to path to allow running without installing (just in case)
+# Explicitly add the project root to sys.path to allow execution 
+# without installing the package (e.g., when running from the 'scripts' folder).
 project_root = Path(__file__).resolve().parent.parent
+if str(project_root) not in sys.path:
+    sys.path.append(str(project_root))
 
 from cpsat_dbap.instance import parse_instance
 from cpsat_dbap.solver import solve, SolverConfig
 from cpsat_dbap.plotting import plot_schedule
 
-def main():
-    # ------------------------------------------------------------------
-    # 1. Setup Paths
-    # ------------------------------------------------------------------
-    # Adjust this filename if you want to run a different instance
-    instance_filename = "f200x15-03.txt"
+def main() -> None:
+    """
+    Main execution entry point for solving a specific DBAP instance file.
     
+    This workflow:
+    1. Loads a text-based instance file from the 'data' directory.
+    2. Parses the layout into a DBAPInstance object.
+    3. Configures the CP-SAT solver (limits, workers, hints).
+    4. Solves the problem to minimize weighted turnaround time.
+    5. Reports metrics and displays a Gantt chart.
+    """
+    
+    # --- 1. Path Configuration ---
+    
+    # Name of the instance file to solve
+    instance_filename = "f200x15-01.txt"
+    
+    # Construct the absolute path to the data file
     data_path = project_root / "data" / instance_filename
 
     if not data_path.exists():
@@ -45,9 +59,8 @@ def main():
         print("Please ensure the 'data' folder exists in the project root.")
         return
 
-    # ------------------------------------------------------------------
-    # 2. Parse Instance
-    # ------------------------------------------------------------------
+    # --- 2. Instance Parsing ---
+    
     print(f"Loading instance: {instance_filename}...")
     try:
         with open(data_path, "r") as f:
@@ -58,22 +71,20 @@ def main():
 
     print(f"Successfully loaded {instance.num_vessels} vessels and {instance.num_berths} berths.")
 
-    # ------------------------------------------------------------------
-    # 3. Configure & Solve
-    # ------------------------------------------------------------------
+    # --- 3. Solver Configuration & Execution ---
+    
     config = SolverConfig(
-        time_limit_seconds=40.0,
-        log_search_progress=False,
-        num_workers=os.cpu_count() or 0,  # Use all available cores
-        use_hints=True
+        time_limit_seconds=60.0,
+        log_search_progress=True,         # Enable logging to see solver convergence
+        num_workers=os.cpu_count() or 0,  # Utilize all available CPU cores
+        use_hints=True                    # Warm-start with the greedy heuristic
     )
 
     print(f"\nStarting solver (Time Limit: {config.time_limit_seconds}s)...")
     solution = solve(instance, config)
 
-    # ------------------------------------------------------------------
-    # 4. Report & Plot
-    # ------------------------------------------------------------------
+    # --- 4. Reporting & Visualization ---
+    
     if solution:
         print("\n" + "="*50)
         print("  SOLUTION FOUND")
@@ -83,19 +94,21 @@ def main():
         print(f"Mean Turnaround Time:    {solution.mean_turnaround_time:.2f}")
         print("-" * 50)
         
-        # Print first 10 vessels as a preview
+        # Display a preview table of the first 10 assignments
         print(f"{'Vessel':<8} | {'Berth':<6} | {'Arrival':<8} | {'Start':<8} | {'End':<8}")
         print("-" * 50)
-        for v in range(min(10, instance.num_vessels)):
+        
+        preview_limit = 10
+        for v in range(min(preview_limit, instance.num_vessels)):
             print(f"V{v:<7} | B{solution.vessel_berths[v]:<5} | "
                   f"{instance.arrival_times[v]:<8} | "
                   f"{solution.vessel_start_times[v]:<8} | "
                   f"{solution.vessel_end_times[v]:<8}")
         
-        if instance.num_vessels > 10:
-            print(f"... and {instance.num_vessels - 10} more.")
+        if instance.num_vessels > preview_limit:
+            print(f"... and {instance.num_vessels - preview_limit} more.")
 
-        # Plot
+        # Generate and show the Gantt chart
         print("\nGenerating Gantt Chart...")
         plot_schedule(
             solution, 
@@ -103,11 +116,11 @@ def main():
             title=f"Schedule for {instance_filename} (Makespan: {solution.makespan})"
         )
         
-        # This keeps the window open until you close it
+        # Block execution until the plot window is closed
         plt.show()
 
     else:
-        print("\nNo solution found within the time limit.")
+        print("\nNo feasible solution found within the time limit.")
 
 if __name__ == "__main__":
     main()

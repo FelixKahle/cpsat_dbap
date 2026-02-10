@@ -19,7 +19,7 @@
 # OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION
 # WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 
-from typing import Optional, List, Tuple, Any
+from typing import Optional, List, Tuple
 import matplotlib.pyplot as plt
 import matplotlib.patches as mpatches
 import matplotlib.colors as mcolors
@@ -37,69 +37,83 @@ def plot_schedule(
     title: str = "Berth Allocation Schedule"
 ) -> Tuple[Figure, Axes]:
     """
-    Generates a Gantt chart for the given solution.
+    Generates a Gantt chart visualization for a Berth Allocation Solution.
+
+    The chart displays berths on the Y-axis and time on the X-axis. 
+    It visualizes:
+    1. Vessel processing blocks (colored bars).
+    2. Berth unavailability/closure windows (gray hatched areas), if instance data is provided.
+    3. Waiting times (red dotted lines from arrival to start), if instance data is provided.
 
     Args:
-        solution: The solution object containing the schedule.
-        instance: (Optional) The original instance. If provided, the chart will
-                  show berth availability windows and vessel arrival markers.
-        title: Title of the chart.
+        solution: The solution object containing the calculated schedule.
+        instance: (Optional) The original problem instance. providing this enables
+                  visualization of berth limits and vessel arrival delays.
+        title: The title text for the chart.
 
     Returns:
-        A tuple (Figure, Axes) containing the generated plot.
-        The caller is responsible for calling plt.show() or fig.savefig().
+        A tuple (Figure, Axes) containing the generated matplotlib plot.
+        The caller is responsible for displaying (plt.show) or saving the figure.
     """
     if solution.num_vessels == 0:
         print("Warning: Empty solution provided to plot_schedule.")
-        # Return an empty figure to prevent crashes
+        # Return an empty figure to prevent runtime errors in the caller
         return plt.subplots()
 
-    # Create figure
+    # Initialize the figure layout
     fig, ax = plt.subplots(figsize=(14, 8))
     
-    # --- Setup Y-Axis (Berths) ---
+    # --- Axis Configuration ---
+    
+    # Determine the number of berths to display
     if instance:
         num_berths = instance.num_berths
     else:
+        # Fallback if instance is missing: infer from solution
         num_berths = max(solution.vessel_berths) + 1 if solution.vessel_berths else 1
         
     berth_indices = range(num_berths)
     
-    # --- 1. Draw Berth Availability (Gray Zones) ---
+    # --- Berth Availability Visualization ---
+    
     if instance:
-        # Determine plot horizon
+        # Calculate the visual horizon for the plot
+        # We find the latest closing time across all berths to define the x-axis limit
         max_end = 0
         for interval in instance.berth_opening_times:
+            # Check for finite finish times to avoid infinite loops/plots
             if interval.finish < float('inf'):
                  max_end = max(max_end, interval.finish)
         
+        # Extend the plot limit slightly beyond the schedule makespan or berth closing
         plot_limit = max(solution.makespan, max_end) if max_end > 0 else solution.makespan + 50
         
         for b in berth_indices:
             interval = instance.berth_opening_times[b]
             
-            # Gray out time BEFORE opening
+            # Visualize the "Closed" period before the berth opens
             if interval.start > 0:
                 ax.broken_barh(
-                    [(0, interval.start)], 
-                    (b - 0.4, 0.8), 
+                    xranges=[(0, interval.start)], 
+                    yrange=(b - 0.4, 0.8), 
                     facecolors='gray', 
                     alpha=0.3, 
                     hatch='///'
                 )
                 
-            # Gray out time AFTER closing
+            # Visualize the "Closed" period after the berth closes
             if interval.finish < plot_limit:
                  ax.broken_barh(
-                    [(interval.finish, plot_limit - interval.finish)], 
-                    (b - 0.4, 0.8), 
+                    xranges=[(interval.finish, plot_limit - interval.finish)], 
+                    yrange=(b - 0.4, 0.8), 
                     facecolors='gray', 
                     alpha=0.3, 
                     hatch='///'
                 )
 
-    # --- 2. Draw Vessels ---
-    # Use standard Tableau colors for distinctness
+    # --- Vessel Schedule Visualization ---
+    
+    # Use Tableau colors for distinct, professional coloring of vessels
     colors = list(mcolors.TABLEAU_COLORS.values())
     
     for i in range(solution.num_vessels):
@@ -108,26 +122,27 @@ def plot_schedule(
         end = solution.vessel_end_times[i]
         duration = end - start
         
+        # Cycle through colors based on vessel index
         col = colors[i % len(colors)]
         
-        # Main Gantt Bar (Processing)
+        # Draw the main Gantt bar representing processing time
         ax.barh(
-            b, 
-            duration, 
+            y=b, 
+            width=duration, 
             left=start, 
             height=0.6, 
             color=col, 
             edgecolor='black', 
             alpha=0.9,
             align='center',
-            zorder=3
+            zorder=3  # Ensure bars sit above grid lines
         )
         
-        # Label inside bar
+        # Place label inside the bar
         ax.text(
-            start + duration / 2, 
-            b, 
-            f"V{i}", 
+            x=start + duration / 2, 
+            y=b, 
+            s=f"V{i}", 
             ha='center', 
             va='center', 
             color='white', 
@@ -136,11 +151,14 @@ def plot_schedule(
             zorder=4
         )
 
-        # --- 3. Draw Waiting Time (if instance provided) ---
+        # --- Waiting Time Visualization ---
+        
         if instance:
             arrival = instance.arrival_times[i]
+            
+            # If start time is later than arrival, visualize the wait
             if start > arrival:
-                # Dotted line from arrival to start
+                # Dotted line connecting Arrival Time to Start Time
                 ax.plot(
                     [arrival, start], 
                     [b, b], 
@@ -149,7 +167,7 @@ def plot_schedule(
                     linewidth=1.5,
                     zorder=2
                 )
-                # Small tick at arrival
+                # Vertical tick mark indicating the Arrival Time
                 ax.plot(
                     [arrival], 
                     [b], 
@@ -160,20 +178,24 @@ def plot_schedule(
                     zorder=2
                 )
 
-    # --- Formatting ---
+    # --- Final Plot Formatting ---
+    
+    # Configure Y-axis with Berth labels
     ax.set_yticks(list(berth_indices))
     ax.set_yticklabels([f"Berth {b}" for b in berth_indices])
+    
     ax.set_xlabel("Time")
     ax.set_title(title)
     
-    # Grid
+    # Add vertical grid lines for easier time reading
     ax.grid(True, axis='x', linestyle='--', alpha=0.5, zorder=0)
     
-    # Legend construction
+    # Construct a custom legend
     legend_patches: List[Artist] = [
         mpatches.Patch(color='gray', alpha=0.3, hatch='///', label='Berth Closed'),
         mpatches.Patch(color=colors[0], label='Vessel Processing')
     ]
+    
     if instance:
         legend_patches.append(
             Line2D([0], [0], color='red', linestyle=':', marker='|', label='Waiting Time')
